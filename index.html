@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project timeline</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <div>
+        <h1>Student portal<br>timeline</h1>
+        <p class="hint">Drag a bar to move a task. Pull its right edge to change the end date. Click a task to edit it.</p>
+      </div>
+      <button class="btn primary" id="addBtn" type="button">New task</button>
+    </header>
+
+    <section class="stats" id="stats" aria-label="Project summary"></section>
+
+    <section class="panel">
+      <div class="toolbar">
+        <div class="seg" role="group" aria-label="Zoom">
+          <button type="button" data-zoom="40" aria-pressed="true">Days</button>
+          <button type="button" data-zoom="16" aria-pressed="false">Weeks</button>
+        </div>
+        <button class="btn" id="todayBtn" type="button">Go to today</button>
+        <span class="sync" id="sync"></span>
+        <div class="legend">
+          <span style="--c: var(--done)"><i></i>Done</span>
+          <span style="--c: var(--active)"><i></i>In progress</span>
+          <span style="--c: var(--late)"><i></i>Late</span>
+          <span style="--c: var(--next)"><i></i>Not started</span>
+        </div>
+      </div>
+
+      <div class="board" id="board">
+        <div class="side">
+          <div class="side-head">Tasks <span id="count"></span></div>
+          <div id="sideRows"></div>
+        </div>
+        <div class="tl-scroll" id="scroll">
+          <div class="tl-inner" id="timeline">
+            <div class="tl-head">
+              <div class="months" id="months"></div>
+              <div class="days" id="days"></div>
+            </div>
+            <div class="tl-body" id="body"></div>
+            <div class="today-line" id="todayLine"></div>
+          </div>
+        </div>
+      </div>
+      <div class="empty" id="empty" hidden>
+        <b>No tasks yet</b>
+        Add your first task to start building the timeline.
+      </div>
+    </section>
+  </main>
+
+  <dialog id="dialog">
+    <form id="form" method="dialog" novalidate>
+      <h2 id="dialogTitle">New task</h2>
+      <label>Task name
+        <input type="text" id="fName" required maxlength="60" placeholder="Write the test plan">
+      </label>
+      <label>Owner
+        <input type="text" id="fOwner" maxlength="30" placeholder="Who is responsible?">
+      </label>
+      <div class="two">
+        <label>Start <input type="date" id="fStart" required></label>
+        <label>End <input type="date" id="fEnd" required></label>
+      </div>
+      <label>
+        <span class="range-head"><span>Progress</span><output id="fOut">0%</output></span>
+        <input type="range" id="fProgress" min="0" max="100" step="5" value="0">
+      </label>
+      <p class="error" id="error" role="alert"></p>
+      <div class="actions">
+        <button class="btn danger" type="button" id="deleteBtn" hidden>Delete</button>
+        <span class="spacer"></span>
+        <button class="btn" type="button" id="cancelBtn">Cancel</button>
+        <button class="btn primary" type="submit" id="saveBtn">Save task</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status"></div>
+
+  <script src="api/api.js"></script>
+  <script>
+    /* ---------- date helpers (all dates are local, YYYY-MM-DD) ---------- */
+    const DAY = 86400000;
+    const $ = (id) => document.getElementById(id);
+    const parse = (s) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
+    const pad = (n) => String(n).padStart(2, "0");
+    const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const diff = (a, b) => Math.round((a - b) / DAY);
+    const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const short = (d) => d.toLocaleDateString("en", { day: "numeric", month: "short" });
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+    /* ---------- state ---------- */
+    let tasks = [];
+    let dw = 40;            // pixels per day
+    let rangeStart = today; // first day shown on the timeline
+    let firstLoad = true;
+    let editingId = null;
+
+    const STATUS = {
+      done:   { label: "Done" },
+      active: { label: "In progress" },
+      late:   { label: "Late" },
+      next:   { label: "Not started" },
+    };
+    function statusOf(t) {
+      if (t.progress >= 100) return "done";
+      if (parse(t.end) < today) return "late";
+      if (parse(t.start) <= today) return "active";
+      return "next";
+    }
+
+    function toast(msg) {
+      const el = $("toast");
+      el.textContent = msg;
+      el.classList.add("show");
+      clearTimeout(toast.t);
+      toast.t = setTimeout(() => el.classList.remove("show"), 3200);
+    }
+
+    /* ---------- data ---------- */
+    async function load() {
+      try {
+        tasks = await GanttAPI.getTasks();
+      } catch (err) {
+        toast("Could not load tasks: " + err.message);
+        tasks = [];
+      }
+      tasks.sort((a, b) => parse(a.start) - parse(b.start));
+      render();
+    }
+
+    async function run(promise, okMsg) {
+      try {
+        await promise;
+        if (okMsg) toast(okMsg);
+      } catch (err) {
+        toast("Save failed: " + err.message);
+      }
+      await load();
+    }
+
+    /* ---------- rendering ---------- */
+    function renderStats() {
+      if (!tasks.length) { $("stats").innerHTML = ""; return; }
+      let weighted = 0, total = 0;
+      tasks.forEach((t) => {
+        const dur = diff(parse(t.end), parse(t.start)) + 1;
+        weighted += t.progress * dur;
+        total += dur;
+      });
+      const overall = Math.round(weighted / total);
+      const done = tasks.filter((t) => t.progress >= 100).length;
+      const late = tasks.filter((t) => statusOf(t) === "late").length;
+      const lastEnd = new Date(Math.max(...tasks.map((t) => parse(t.end))));
+      const left = diff(lastEnd, today);
+      const deadline = overall >= 100 ? "Finished" : left >= 0 ? `${left} days` : `${-left} days over`;
+      const deadlineLabel = overall >= 100 ? "project complete" : left >= 0 ? `until ${short(lastEnd)}` : `since ${short(lastEnd)}`;
+
+      $("stats").innerHTML = `
+        <div class="stat"><b>${overall}%</b><span>overall progress</span></div>
+        <div class="stat"><b>${done} of ${tasks.length}</b><span>tasks done</span></div>
+        <div class="stat ${late ? "warn" : ""}"><b>${late}</b><span>${late === 1 ? "task is late" : "tasks are late"}</span></div>
+        <div class="stat"><b>${deadline}</b><span>${deadlineLabel}</span></div>`;
+    }
+
+    function render() {
+      renderStats();
+      const mode = GanttAPI.mode();
+      $("sync").textContent = mode === "n8n" ? "Synced with n8n" : "Saved in this browser";
+      $("sync").className = "sync " + mode;
+      $("count").textContent = tasks.length ? `${tasks.length} total` : "";
+
+      const hasTasks = tasks.length > 0;
+      $("board").hidden = !hasTasks;
+      $("empty").hidden = hasTasks;
+      if (!hasTasks) return;
+
+      // visible range: Monday before the first task to 10 days after the last, at least 6 weeks
+      const first = new Date(Math.min(today, ...tasks.map((t) => parse(t.start))));
+      const last = new Date(Math.max(today, ...tasks.map((t) => parse(t.end))));
+      rangeStart = addDays(first, -((first.getDay() + 6) % 7));
+      const totalDays = Math.max(42, diff(last, rangeStart) + 11);
+      const width = totalDays * dw;
+      $("timeline").style.width = width + "px";
+
+      // header: months row + days row, and the day grid behind the bars
+      let months = "", days = "", grid = "";
+      let monthKey = null, monthCount = 0, monthLabel = "";
+      const flush = () => { if (monthCount) months += `<div class="month" style="width:${monthCount * dw}px">${monthLabel}</div>`; };
+      for (let i = 0; i < totalDays; i++) {
+        const d = addDays(rangeStart, i);
+        const key = d.getFullYear() * 12 + d.getMonth();
+        if (key !== monthKey) {
+          flush();
+          monthKey = key; monthCount = 0;
+          monthLabel = d.toLocaleDateString("en", { month: "long", year: "numeric" });
+        }
+        monthCount++;
+        const weekend = d.getDay() === 0 || d.getDay() === 6;
+        const isToday = diff(d, today) === 0;
+        const cls = "day" + (weekend ? " weekend" : "") + (isToday ? " today" : "");
+        if (dw >= 30) {
+          days += `<div class="${cls}" style="width:${dw}px"><em>${d.toLocaleDateString("en", { weekday: "narrow" })}</em><span>${d.getDate()}</span></div>`;
+        } else {
+          const monday = d.getDay() === 1;
+          days += `<div class="${cls} sparse" style="width:${dw}px">${monday || isToday ? `<span>${d.getDate()}</span>` : ""}</div>`;
+        }
+        grid += `<div class="gday${weekend ? " weekend" : ""}" style="width:${dw}px"></div>`;
+      }
+      flush();
+      $("months").innerHTML = months;
+      $("days").innerHTML = days;
+
+      // rows: left list and timeline bars share the same row height
+      let side = "", rows = "";
+      tasks.forEach((t, i) => {
+        const st = statusOf(t);
+        const s = parse(t.start), e = parse(t.end);
+        const left = diff(s, rangeStart) * dw;
+        const w = (diff(e, s) + 1) * dw;
+        side += `
+          <button class="t-row" type="button" data-id="${t.id}">
+            <span class="t-name">${esc(t.name)}</span>
+            <span class="t-meta">
+              <span class="chip" style="--c: var(--${st})"><i></i>${STATUS[st].label}</span>
+              <span class="dates">${short(s)} to ${short(e)}</span>
+              ${t.owner ? `<span>${esc(t.owner)}</span>` : ""}
+            </span>
+          </button>`;
+        rows += `
+          <div class="tl-row">
+            <div class="bar ${st}" data-id="${t.id}" style="left:${left}px;width:${w}px;--i:${i}"
+                 title="${esc(t.name)}: ${short(s)} to ${short(e)}, ${t.progress}%">
+              <div class="fill" style="width:${t.progress}%"></div>
+              <span class="bar-label">${t.progress}%</span>
+              <span class="handle" aria-hidden="true"></span>
+            </div>
+          </div>`;
+      });
+      $("sideRows").innerHTML = side;
+      $("body").innerHTML = `<div class="grid">${grid}</div>${rows}`;
+
+      $("todayLine").style.left = (diff(today, rangeStart) * dw + dw / 2) + "px";
+
+      if (firstLoad) {
+        $("timeline").classList.add("first-load");
+        scrollToToday();
+        firstLoad = false;
+      } else {
+        $("timeline").classList.remove("first-load");
+      }
+    }
+
+    function scrollToToday() {
+      const x = diff(today, rangeStart) * dw;
+      $("scroll").scrollTo({ left: Math.max(0, x - $("scroll").clientWidth / 3), behavior: "smooth" });
+    }
+
+    /* ---------- drag to move / resize ---------- */
+    let drag = null;
+    $("timeline").addEventListener("pointerdown", (e) => {
+      const bar = e.target.closest(".bar");
+      if (!bar || e.button !== 0) return;
+      const t = tasks.find((x) => x.id === bar.dataset.id);
+      if (!t) return;
+      drag = {
+        bar, t, delta: 0, moved: false, x0: e.clientX,
+        mode: e.target.closest(".handle") ? "resize" : "move",
+        left0: diff(parse(t.start), rangeStart) * dw,
+        days0: diff(parse(t.end), parse(t.start)) + 1,
+      };
+      bar.setPointerCapture(e.pointerId);
+      bar.classList.add("dragging");
+    });
+    $("timeline").addEventListener("pointermove", (e) => {
+      if (!drag) return;
+      const dx = e.clientX - drag.x0;
+      if (Math.abs(dx) > 4) drag.moved = true;
+      let delta = Math.round(dx / dw);
+      if (drag.mode === "resize") {
+        delta = Math.max(delta, 1 - drag.days0);
+        drag.bar.style.width = (drag.days0 + delta) * dw + "px";
+      } else {
+        drag.bar.style.left = drag.left0 + delta * dw + "px";
+      }
+      drag.delta = delta;
+    });
+    const endDrag = async (e) => {
+      if (!drag) return;
+      const { t, mode, delta, moved } = drag;
+      drag.bar.classList.remove("dragging");
+      drag = null;
+      if (!moved) return openDialog(t);
+      if (delta === 0) return render();
+      const s = parse(t.start), en = parse(t.end);
+      const changes = mode === "resize"
+        ? { end: iso(addDays(en, delta)) }
+        : { start: iso(addDays(s, delta)), end: iso(addDays(en, delta)) };
+      await run(GanttAPI.updateTask(t.id, changes), "Task updated");
+    };
+    $("timeline").addEventListener("pointerup", endDrag);
+    $("timeline").addEventListener("pointercancel", () => { drag = null; render(); });
+
+    /* ---------- dialog (add / edit / delete) ---------- */
+    const dialog = $("dialog");
+
+    function openDialog(t) {
+      editingId = t ? t.id : null;
+      $("dialogTitle").textContent = t ? "Edit task" : "New task";
+      $("fName").value = t ? t.name : "";
+      $("fOwner").value = t ? t.owner : "";
+      $("fStart").value = t ? t.start : iso(today);
+      $("fEnd").value = t ? t.end : iso(addDays(today, 6));
+      $("fProgress").value = t ? t.progress : 0;
+      $("fOut").textContent = $("fProgress").value + "%";
+      $("deleteBtn").hidden = !t;
+      $("error").textContent = "";
+      dialog.showModal();
+      $("fName").focus();
+    }
+
+    $("fProgress").addEventListener("input", () => { $("fOut").textContent = $("fProgress").value + "%"; });
+    $("addBtn").addEventListener("click", () => openDialog(null));
+    $("cancelBtn").addEventListener("click", () => dialog.close());
+    dialog.addEventListener("click", (e) => { if (e.target === dialog) dialog.close(); });
+
+    $("form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const name = $("fName").value.trim();
+      const start = $("fStart").value, end = $("fEnd").value;
+      if (!name) return ($("error").textContent = "Give the task a name.");
+      if (!start || !end) return ($("error").textContent = "Choose a start and an end date.");
+      if (parse(end) < parse(start)) return ($("error").textContent = "The end date must be on or after the start date.");
+      const data = { name, owner: $("fOwner").value, start, end, progress: Number($("fProgress").value) };
+      dialog.close();
+      if (editingId) await run(GanttAPI.updateTask(editingId, data), "Task updated");
+      else await run(GanttAPI.createTask(data), "Task added");
+    });
+
+    $("deleteBtn").addEventListener("click", async () => {
+      if (!confirm("Delete this task?")) return;
+      const id = editingId;
+      dialog.close();
+      await run(GanttAPI.deleteTask(id), "Task deleted");
+    });
+
+    /* ---------- toolbar + list ---------- */
+    $("sideRows").addEventListener("click", (e) => {
+      const row = e.target.closest(".t-row");
+      if (row) openDialog(tasks.find((t) => t.id === row.dataset.id));
+    });
+    document.querySelectorAll("[data-zoom]").forEach((b) =>
+      b.addEventListener("click", () => {
+        dw = Number(b.dataset.zoom);
+        document.querySelectorAll("[data-zoom]").forEach((x) => x.setAttribute("aria-pressed", x === b));
+        render();
+        scrollToToday();
+      })
+    );
+    $("todayBtn").addEventListener("click", scrollToToday);
+
+    load();
+  </script>
+</body>
+</html>
